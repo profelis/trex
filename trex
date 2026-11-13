@@ -1,0 +1,803 @@
+#!/usr/bin/env python3
+# trex — coding agents talking to each other inside Rex.
+#
+# Every agent (Claude Code, Codex, OpenCode) runs as its normal TUI in a Rex
+# pane. trex finds those panes, starts new ones, and delivers a message by
+# pasting it into the recipient's prompt; the recipient answers the same way,
+# so the answer arrives as the sender's next prompt. The only state of its
+# own is who started whom (LINKS), which trex-watch.lua beside this script
+# turns into tab labels; everything else is what Rex knows about its panes.
+#
+#   trex ls [-a]                       agents as a tree of who started whom
+#   trex spawn AGENT [-n NAME] [PROMPT]  start an agent in a new pane
+#   trex send TARGET [TEXT]            message an agent (stdin when no TEXT)
+#   trex reply [TEXT]                  answer the agent that started you
+#   trex inbox [--wait]                messages left for you (a root agent)
+#   trex wait TARGET [--for SECS]      block until its turn ends
+#   trex read TARGET [-n LINES]        tail of what its pane shows
+#   trex stop TARGET                   interrupt its turn; the pane stays
+#   trex close TARGET                  close its pane
+#
+# See README.md. Everything tweakable lives in the SETTINGS block below.
+import argparse
+import fcntl
+import json
+import os
+import select
+import shutil
+import subprocess
+import sys
+import time
+from concurrent.futures import ThreadPoolExecutor
+
+# ===========================================================================
+# SETTINGS
+# ===========================================================================
+
+# The agents trex knows. The key is both the name used on the command line
+# and the process name it looks for in a pane.
+#   cmd          how `spawn` starts it
+#   prompt_flag  flag that carries the first prompt (None: a bare argument)
+#   model        arguments behind `spawn -m MODEL` ({model} is replaced)
+#   effort       arguments behind `spawn -e LEVEL` ({effort}); None: no such
+#                setting at start
+#   add_dir      arguments behind each `spawn --add-dir DIR` ({dir}); None:
+#                the agent has no file sandbox to widen
+#   modes        extra arguments per permission mode (see SPAWN_MODE)
+AGENTS = {
+    "claude": {
+        "cmd": ["claude"],
+        "prompt_flag": None,
+        "model": ["--model", "{model}"],
+        "effort": ["--effort", "{effort}"],
+        "add_dir": ["--add-dir", "{dir}"],
+        "modes": {
+            "auto": ["--permission-mode", "auto"],
+            "full": ["--dangerously-skip-permissions"],
+        },
+    },
+    "codex": {
+        # Codex's default sandbox can't reach Rex's unix socket, so it could
+        # receive messages but never answer. Network access opens the socket
+        # and leaves the workspace-write file sandbox as it is.
+        "cmd": ["codex", "-c", "sandbox_workspace_write.network_access=true"],
+        "prompt_flag": None,
+        "model": ["--model", "{model}"],
+        "effort": ["-c", "model_reasoning_effort={effort}"],
+        # The workspace-write sandbox writes only under the working directory,
+        # and never into a .git, not even one added here: git commands that
+        # write need the agent to ask for escalation, which --approve-for-me
+        # hands to the automatic reviewer.
+        "add_dir": ["--add-dir", "{dir}"],
+        "modes": {
+            "auto": ["--approve-for-me"],
+            "full": ["--dangerously-bypass-approvals-and-sandbox"],
+        },
+    },
+    "opencode": {
+        "cmd": ["opencode"],
+        "prompt_flag": "--prompt",
+        # The TUI has no --model (only `opencode run` does). A model comes in
+        # through inline config, which the shared background service never
+        # reads, so a pane with its own model runs its own server.
+        "model": ["--standalone"],
+        "model_env": {"OPENCODE_CONFIG_CONTENT": '{{"model": "{model}"}}'},
+        # A variant is part of the model's name: provider/model#variant.
+        "effort": None,
+        "add_dir": None,
+        # Without --auto, what it may do without asking is the "permission"
+        # section of opencode.jsonc, and with none it asks nothing.
+        "modes": {
+            "auto": ["--auto"],
+            "full": ["--auto"],
+        },
+    },
+}
+
+# How much a spawned agent may do without asking; `spawn --mode` overrides it.
+#   own   nothing added: the agent's own config decides
+#   auto  routine actions are approved by the agent's automatic reviewer
+#   full  no permission prompts and no sandbox at all
+# An agent may not start another one in "full" unless that is the mode set
+# here: handing out full access is the user's decision, here or from a shell.
+SPAWN_MODE = "auto"
+MODES = ("own", "auto", "full")
+
+# Where `spawn` puts the new pane: "tab", or a split beside the caller's pane
+# ("right", "left", "above", "below"). `spawn --split DIR` overrides it.
+SPAWN_PLACE = "tab"
+# Whether the new pane takes focus away from where the user is.
+SPAWN_FOCUS = False
+
+# `spawn --worktree NAME`: where the worktree goes, relative to the main
+# checkout's directory; {repo} is that directory's name, so two checkouts
+# side by side don't share one. NAME is both the directory and the branch.
+WORKTREE_DIR = "../worktrees/{repo}"
+
+# Pause between pasting a message and pressing Enter; the TUIs need a moment
+# to take the paste in before Enter means "submit".
+SUBMIT_DELAY = 0.5
+
+# `wait`: how long before giving up, how often to look when no event about
+# the pane arrives, and how long a target that never reports "working" gets
+# before it counts as finished.
+WAIT_TIMEOUT = 600
+WAIT_POLL = 10.0
+WAIT_GRACE = 5.0
+
+# `spawn`: how long it waits for the new agent to start and, when it was
+# given a prompt, to begin working on it.
+SPAWN_SETTLE = 30.0
+
+# `read`: lines shown by default.
+READ_LINES = 40
+
+# Set by `spawn` in the new agent's environment: the block id of the agent
+# that started it. It is the return address `trex reply` uses, and unlike the
+# prompt it can't scroll out of the agent's context.
+PARENT_ENV = "TREX_PARENT"
+
+# Pane labels that are Rex's own defaults, not names anyone chose.
+DEFAULT_LABELS = {"", "shell"}
+
+REX = os.environ.get("REX_BIN", "rex")
+
+# Who started whom: {child block: {parent, session, name, parent_name}}.
+# Written by `spawn`, read by `ls` and by the watcher.
+STATE_DIR = os.path.join(os.environ.get("XDG_STATE_HOME")
+                         or os.path.expanduser("~/.local/state"), "trex")
+LINKS = os.path.join(STATE_DIR, "links.json")
+# The watcher (trex-watch.lua) touches this file every few seconds; `spawn`
+# starts a new one when it is older than WATCH_STALE seconds.
+WATCH_BEAT = os.path.join(STATE_DIR, "watch.beat")
+WATCH_STALE = 15
+# Messages for a root agent -- one nobody started through trex, so a person
+# types in its pane -- are left here instead of pasted over what they type:
+# INBOX/<block id>/<time>-<pid>.txt. Agents of these kinds read them with
+# `trex inbox --wait` in the background; any other root still gets a paste.
+INBOX = os.path.join(STATE_DIR, "inbox")
+INBOX_AGENTS = {"claude"}
+INBOX_POLL = 1.0
+WATCH_SCRIPT = os.path.join(os.path.dirname(os.path.realpath(__file__)), "trex-watch.lua")
+
+# ===========================================================================
+
+
+def die(msg, code=1):
+    print("trex: " + msg, file=sys.stderr)
+    sys.exit(code)
+
+
+def rex(*args, stdin=None, check=True):
+    if not shutil.which(REX):
+        die("rex isn't on PATH; trex only works with Rex installed")
+    p = subprocess.run([REX, *args], input=stdin, capture_output=True, text=True)
+    if p.returncode != 0 and check:
+        err = p.stderr.strip()
+        if "operation not permitted" in err:
+            die("your sandbox blocks Rex's socket. Rerun this command outside "
+                "the sandbox (Codex: ask for escalated permissions, or start "
+                "it with -c sandbox_workspace_write.network_access=true)", 77)
+        die("rex %s: %s" % (args[0], err or "failed"))
+    return p.stdout
+
+
+def rex_json(*args, **kw):
+    out = rex(*args, **kw)
+    try:
+        return json.loads(out)
+    except ValueError:
+        return {}
+
+
+def short(block_id):
+    return block_id[-8:]
+
+
+def inspect(session, block):
+    """What runs in one pane: the agent kind (None for anything else), its
+    state as it reports it to Rex, its directory and title."""
+    sid, bid = session["session_id"], block["block_id"]
+    proc = rex_json("block", "call", "-s", sid, "-b", bid, "process", check=False)
+    fg = proc.get("foreground") or {}
+    names = [fg.get("name")] + [a.get("name") for a in proc.get("ancestors") or []]
+    kind = next((n for n in names if n in AGENTS), None)
+    if not kind:
+        return None
+    records = rex_json("block", "call", "-s", sid, "-b", bid, "program_status",
+                       check=False).get("records") or []
+    rec = records[0] if records else {}
+    title = rec.get("title") or rex_json(
+        "block", "call", "-s", sid, "-b", bid, "title", check=False).get("title")
+    label = block.get("label") or ""
+    return {
+        "name": kind if label in DEFAULT_LABELS else label,
+        "kind": kind,
+        "state": rec.get("state") or "-",
+        "state_kind": rec.get("kind") or "",
+        "title": title or "",
+        "cwd": fg.get("cwd") or "",
+        "block": bid,
+        "session": sid,
+        "session_label": session.get("label") or "",
+        "me": bid == os.environ.get("REX_BLOCK"),
+    }
+
+
+def discover(everywhere):
+    """Agent panes, the caller's session first."""
+    here = os.environ.get("REX_SESSION")
+    sessions = rex_json("ls", "--json").get("sessions") or []
+    if not everywhere and here:
+        sessions = [s for s in sessions if s["session_id"] == here]
+    sessions.sort(key=lambda s: s["session_id"] != here)
+    jobs = []
+    for s in sessions:
+        listed = rex_json("block", "ls", "-s", s["session_id"], "--json", check=False)
+        for b in listed.get("blocks") or []:
+            if b.get("creator_name") == "com.superlogical.terminal":
+                jobs.append((s, b))
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        found = pool.map(lambda j: inspect(*j), jobs)
+    return [a for a in found if a]
+
+
+def me():
+    """The agent calling trex, or None when a person runs it from a shell."""
+    if not os.environ.get("REX_BLOCK"):
+        return None
+    return next((a for a in discover(False) if a["me"]), None)
+
+
+def resolve(target):
+    """TARGET is a pane's name, an agent kind, or a block id (or its tail).
+    A name only reaches this session: other sessions hold unrelated work, and
+    a message meant for "codex" must not land in some other project's Codex.
+    A block id reaches anywhere."""
+    here = os.environ.get("REX_SESSION")
+    found = discover(True)
+    agents = [a for a in found if not a["me"]]
+    hits = [a for a in agents
+            if a["block"] == target or (len(target) >= 6 and a["block"].endswith(target))]
+    if not hits:
+        hits = [a for a in agents if target in (a["name"], a["kind"])
+                and (not here or a["session"] == here)]
+    if not hits:
+        if any(a["me"] and target in (a["name"], a["kind"], a["block"]) for a in found):
+            die("that's your own pane")
+        die("no agent '%s' in this session; `trex ls -a` lists every "
+            "session's, and a block id reaches them" % target)
+    if len(hits) > 1:
+        die("'%s' matches several agents, use a block id:\n%s" % (
+            target, "\n".join("  %s  %s  %s" % (a["block"], a["name"], a["cwd"])
+                              for a in hits)))
+    return hits[0]
+
+
+def envelope(sender, text, reply=False, fyi=False, spawned=False):
+    """Wrap a message so the recipient knows who it is from and how to answer.
+    The instructions travel with the message, so the recipient needs no skill
+    installed to take part."""
+    if not sender:
+        return text
+    who = "%s (%s)" % (sender["name"], sender["kind"]) \
+        if sender["name"] != sender["kind"] else sender["name"]
+    if reply:
+        return ("[trex] Answer from %s, another agent in Rex, to your "
+                "message:\n%s\n[trex] Carry on with your task. Don't "
+                "acknowledge this." % (who, text))
+    if fyi:
+        return ("[trex] Note from %s, another agent in Rex (not the user):\n"
+                "%s\n[trex] For your information only. Don't reply." % (who, text))
+    how = "trex reply" if spawned else "trex send --reply " + sender["block"]
+    return ("[trex] Message from %s, another agent in Rex (not the user):\n"
+            "%s\n[trex] When you have the result, answer with: "
+            "%s \"<answer>\"  (long answers: pipe them on "
+            "stdin). Answer once, with the result, not with an "
+            "acknowledgement." % (who, text, how))
+
+
+def read_links():
+    try:
+        with open(LINKS) as f:
+            links = json.load(f)
+        return links if isinstance(links, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def write_links(links):
+    os.makedirs(STATE_DIR, exist_ok=True)
+    tmp = LINKS + ".%d" % os.getpid()
+    with open(tmp, "w") as f:
+        json.dump(links, f, indent=1, sort_keys=True)
+    os.replace(tmp, LINKS)
+
+
+def live_blocks():
+    """Every block on the server, by id."""
+    ids = set()
+    for s in rex_json("ls", "--json").get("sessions") or []:
+        listed = rex_json("block", "ls", "-s", s["session_id"], "--json", check=False)
+        ids.update(b["block_id"] for b in listed.get("blocks") or [])
+    return ids
+
+
+def link(child, parent, session, name, parent_name):
+    """Record that PARENT started CHILD, dropping links to closed panes."""
+    links = read_links()
+    alive = live_blocks() | {child}
+    links = {c: l for c, l in links.items() if c in alive and l.get("parent") in alive}
+    links[child] = {"parent": parent, "session": session, "name": name,
+                    "parent_name": parent_name}
+    write_links(links)
+    return links
+
+
+def place_after(session, window, parent_block, links):
+    """Move a new tab just after its parent's tab and the tabs of the
+    parent's earlier children, so the tab bar reads as the tree."""
+    view = rex_json("api", "call", "-s", session, "session.view", check=False)
+    wins = view.get("windows") or []
+    blocks_in = [{b["block_id"] for l in w.get("layers") or [] for b in l.get("blocks") or []}
+                 for w in wins]
+    family = {parent_block} | {c for c, l in links.items() if l.get("parent") == parent_block}
+    at = next((i for i, bs in enumerate(blocks_in) if parent_block in bs), None)
+    if at is None:
+        return
+    while at + 1 < len(wins) and blocks_in[at + 1] & family and wins[at + 1]["window_id"] != window:
+        at += 1
+    rest = [w["window_id"] for w in wins[at + 1:] if w["window_id"] != window]
+    args = {"window_id": window}
+    if rest:
+        args["before_window_id"] = rest[0]
+    rex("api", "call", "-s", session, "session.move_window", json.dumps(args), check=False)
+
+
+def ensure_watch(session):
+    """Start trex-watch.lua in a pane of no window, unless one is beating."""
+    try:
+        if time.time() - os.path.getmtime(WATCH_BEAT) < WATCH_STALE:
+            return
+    except OSError:
+        pass
+    if not os.path.exists(WATCH_SCRIPT):
+        return
+    os.makedirs(STATE_DIR, exist_ok=True)
+    with open(WATCH_BEAT, "w") as f:  # one start per stale period
+        f.write(str(int(time.time())))
+    rex("api", "call", "-s", session, "session.new_block", json.dumps({
+        "flavor": "com.superlogical.terminal.shell", "label": "trex-watch",
+        "options": {"shell": "none",
+                    "command": [shutil.which(REX) or REX, "do", WATCH_SCRIPT, "--all"]}}),
+        check=False)
+
+
+def git(cwd, *args):
+    out = subprocess.run(["git", "-C", cwd] + list(args), capture_output=True, text=True)
+    if out.returncode:
+        die("git %s: %s" % (" ".join(args), out.stderr.strip() or "failed"))
+    return out.stdout.strip()
+
+
+def worktree(cwd, name, base=None):
+    """The directory of worktree NAME of the repository at CWD, made on
+    branch NAME from BASE (default HEAD) when it doesn't exist yet. An
+    existing one is reused as it is, so a reviewer can join the worker."""
+    common = git(cwd, "rev-parse", "--path-format=absolute", "--git-common-dir")
+    main = os.path.dirname(common)
+    path = os.path.normpath(os.path.join(
+        main, WORKTREE_DIR.format(repo=os.path.basename(main)), name))
+    if os.path.isdir(path):
+        if base:
+            die("worktree %s already exists; --base applies only to a new one" % path)
+        return path
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    exists = subprocess.run(["git", "-C", cwd, "rev-parse", "--verify", "--quiet",
+                             "refs/heads/" + name], capture_output=True).returncode == 0
+    if exists:
+        if base:
+            die("branch %s already exists; --base applies only to a new one" % name)
+        git(cwd, "worktree", "add", path, name)
+    else:
+        git(cwd, "worktree", "add", "-b", name, path, base or "HEAD")
+    print("worktree %s on branch %s" % (path, name), file=sys.stderr)
+    return path
+
+
+def spawn_command(agent, mode, model=None, effort=None, dirs=(), prompt=None):
+    """The command line, and the variables to set for it."""
+    spec = AGENTS[agent]
+    cmd = list(spec["cmd"]) + list(spec["modes"].get(mode, []))
+    env = {}
+    if model:
+        cmd += [a.format(model=model) for a in spec["model"]]
+        env.update({k: v.format(model=model)
+                    for k, v in spec.get("model_env", {}).items()})
+    if effort:
+        if spec["effort"] is None:
+            die("%s takes no effort at start: put it in the model "
+                "(provider/model#variant) or its config" % agent, 2)
+        cmd += [a.format(effort=effort) for a in spec["effort"]]
+    for d in dirs:
+        if spec["add_dir"] is None:
+            die("%s has no file sandbox to add a directory to" % agent, 2)
+        cmd += [a.format(dir=os.path.abspath(d)) for a in spec["add_dir"]]
+    if prompt:
+        cmd += ([spec["prompt_flag"]] if spec["prompt_flag"] else []) + [prompt]
+    return cmd, env
+
+
+def read_text(words):
+    text = " ".join(words) if words else ""
+    if not text or text == "-":
+        if sys.stdin.isatty():
+            die("no message: pass it as arguments or on stdin")
+        text = sys.stdin.read()
+    text = text.strip()
+    if not text:
+        die("the message is empty")
+    return text
+
+
+def cmd_ls(args):
+    agents = discover(args.all)
+    if not agents:
+        print("no agents here" + ("" if args.all else " (-a looks in every session)"))
+        return
+    # Children under the agent that started them, in the order found.
+    links = read_links()
+    by_block = {a["block"]: a for a in agents}
+    kids = {}
+    for a in agents:
+        parent = (links.get(a["block"]) or {}).get("parent")
+        kids.setdefault(parent if parent in by_block else None, []).append(a)
+    ordered = []
+
+    def walk(parent, depth):
+        for a in kids.get(parent, []):
+            ordered.append((a, depth))
+            walk(a["block"], depth + 1)
+    walk(None, 0)
+
+    rows = [("", "NAME", "AGENT", "STATE", "BLOCK", "SESSION", "CWD", "TITLE")]
+    home = os.path.expanduser("~")
+    for a, depth in ordered:
+        state = a["state"] + (":" + a["state_kind"] if a["state_kind"] else "")
+        cwd = "~" + a["cwd"][len(home):] if a["cwd"].startswith(home) else a["cwd"]
+        name = ("  " * (depth - 1) + "└ " if depth else "") + a["name"]
+        rows.append(("*" if a["me"] else "", name, a["kind"], state,
+                     short(a["block"]), a["session_label"], cwd, a["title"]))
+    widths = [max(len(r[i]) for r in rows) for i in range(len(rows[0]) - 1)]
+    for r in rows:
+        line = "  ".join(c.ljust(w) for c, w in zip(r, widths)) + "  " + r[-1]
+        print(line.rstrip())
+
+
+def cmd_spawn(args):
+    session = args.session or os.environ.get("REX_SESSION")
+    if not session:
+        die("not in a Rex pane; pass --session")
+    sender = me()
+    mode = args.mode or SPAWN_MODE
+    if sender and mode == "full" and SPAWN_MODE != "full":
+        die("only the user starts a full-access agent: ask them to run this "
+            "command from a shell", 2)
+    taken = {a["name"] for a in discover(False)}
+    name, n = args.name or args.agent, 1
+    while not args.name and name in taken:
+        n += 1
+        name = "%s-%d" % (args.agent, n)
+    if name in taken:
+        die("an agent named '%s' already runs in this session" % name)
+    cwd = args.cwd or os.getcwd()
+    if args.worktree:
+        cwd = worktree(cwd, args.worktree, args.base)
+
+    prompt = envelope(sender, read_text(args.prompt), spawned=True) \
+        if args.prompt else None
+    cmd, env = spawn_command(args.agent, mode, args.model, args.effort,
+                             args.add_dir or (), prompt)
+    if sender:
+        env[PARENT_ENV] = sender["block"]
+    if env:
+        cmd = ["env"] + ["%s=%s" % kv for kv in sorted(env.items())] + cmd
+
+    place = args.split or SPAWN_PLACE
+    rex_args = ["run", "-s", session, "-c", cwd,
+                "--label", name, "--focus=%s" % str(SPAWN_FOCUS).lower(), "--json"]
+    if place != "tab":
+        rex_args += ["--split", place]
+        if os.environ.get("REX_BLOCK"):
+            rex_args += ["-b", os.environ["REX_BLOCK"]]
+    made = rex_json(*rex_args, "--", *cmd)
+    block = made["block_ids"][0]
+    print("%s\t%s" % (name, block), flush=True)
+    if sender:
+        links = link(block, sender["block"], session, name, sender["name"])
+        if place == "tab" and made.get("window_id"):
+            place_after(session, made["window_id"], sender["block"], links)
+        ensure_watch(session)
+    settle(session, block, name, bool(prompt))
+
+
+def settle(session, block, name, prompted):
+    """Return once the new pane is an agent that names, lists and waits like
+    any other: until then `send`, `wait` and `read` can't find it by name,
+    and a `wait` would take the moment before the first prompt for the end of
+    a turn. Gives up quietly after SPAWN_SETTLE seconds."""
+    deadline = time.time() + SPAWN_SETTLE
+    while time.time() < deadline:
+        cur = inspect({"session_id": session}, {"block_id": block, "label": name})
+        if cur and (not prompted or cur["state"] not in ("-", "idle")):
+            return
+        time.sleep(0.5)
+
+
+def inbox_dir(block):
+    return os.path.join(INBOX, block.replace(":", "_"))
+
+
+def is_root(agent):
+    """Nobody started it through trex: a person works in its pane."""
+    return agent["block"] not in read_links()
+
+
+def leave(target, text):
+    """Put a message in TARGET's inbox, written whole before it shows."""
+    d = inbox_dir(target["block"])
+    os.makedirs(d, exist_ok=True)
+    name = "%.6f-%d.txt" % (time.time(), os.getpid())
+    tmp = os.path.join(d, "." + name)
+    with open(tmp, "w") as f:
+        f.write(text)
+    os.replace(tmp, os.path.join(d, name))
+
+
+def cmd_send(args):
+    target = resolve(args.target)
+    text = envelope(me(), read_text(args.text), reply=args.reply, fyi=args.fyi)
+    if target["kind"] in INBOX_AGENTS and is_root(target):
+        leave(target, text)
+        print("left in %s's inbox: it is a root agent, where a person types"
+              % target["name"])
+        return
+    if target["state"] == "blocked":
+        die("%s is waiting on the user (%s), so the message wasn't delivered: "
+            "Enter would answer that prompt. Try again later." % (
+                target["name"], target["state_kind"] or "blocked"), 2)
+    event = {"block_id": target["block"],
+             "event": {"type": "paste", "payload": {"text": text}}}
+    rex("api", "call", "-s", target["session"], "block.event", "-",
+        stdin=json.dumps(event))
+    time.sleep(SUBMIT_DELAY)
+    rex("send-key", "-s", target["session"], "-b", target["block"], "enter")
+    queued = " (it is mid-turn, so the message is queued)" \
+        if target["state"] == "working" else ""
+    print("delivered to %s%s" % (target["name"], queued))
+
+
+def cmd_reply(args):
+    parent = os.environ.get(PARENT_ENV)
+    if not parent:
+        die("no agent started you through trex ($%s is unset); to answer a "
+            "message, use the `trex send --reply block:...` it ends with"
+            % PARENT_ENV)
+    args.target, args.reply, args.fyi = parent, True, False
+    cmd_send(args)
+
+
+def cmd_inbox(args):
+    """Print the messages left for the calling agent and remove them. With
+    --wait, first block until there is one. One waiter per inbox: a second
+    one exits at once, so a message is never read by a waiter nobody hears."""
+    block = os.environ.get("REX_BLOCK")
+    if not block:
+        die("not in a Rex pane: an inbox belongs to a pane")
+    d = inbox_dir(block)
+    os.makedirs(d, exist_ok=True)
+    if args.wait:
+        lock = open(os.path.join(d, ".wait"), "w")
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            die("another `trex inbox --wait` already waits on this inbox", 75)
+    deadline = time.time() + args.timeout
+    while True:
+        names = sorted(n for n in os.listdir(d) if n.endswith(".txt") and not n.startswith("."))
+        if names or not args.wait:
+            break
+        if time.time() > deadline:
+            print("no message")
+            sys.exit(124)
+        time.sleep(INBOX_POLL)
+    if not names:
+        print("no message")
+        return
+    for i, n in enumerate(names):
+        path = os.path.join(d, n)
+        with open(path) as f:
+            sys.stdout.write(("\n" if i else "") + f.read().rstrip("\n") + "\n")
+        sys.stdout.flush()
+        os.remove(path)
+
+
+def cmd_wait(args):
+    target = resolve(args.target)
+    # Rex's event stream says when anything about the pane changes; the pane
+    # is looked at again then, and at least every WAIT_POLL seconds in case
+    # an event was missed.
+    events = subprocess.Popen([REX, "events", "-s", target["session"], "--json"],
+                              stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+    try:
+        sys.exit(wait_for(target, args.timeout, events))
+    finally:
+        events.kill()
+
+
+def wait_for(target, timeout, events):
+    start = time.time()
+    seen_working = False
+    while True:
+        cur = inspect({"session_id": target["session"]},
+                      {"block_id": target["block"], "label": target["name"]})
+        if not cur:
+            print("closed")
+            return 1
+        if cur["state"] == "working":
+            seen_working = True
+        elif seen_working or time.time() - start > WAIT_GRACE:
+            print(cur["state"] + (":" + cur["state_kind"] if cur["state_kind"] else ""))
+            return 3 if cur["state"] in ("blocked", "error") else 0
+        now = time.time()
+        if now - start > timeout:
+            print("working")
+            return 124
+        # Until the next event about this pane, the grace period's end, or
+        # the next look, whichever comes first.
+        until = min(start + timeout, now + WAIT_POLL,
+                    start + WAIT_GRACE if not seen_working else now + WAIT_POLL)
+        while time.time() < until:
+            ready, _, _ = select.select([events.stdout], [], [], max(0, until - time.time()))
+            if not ready:
+                break
+            line = events.stdout.readline()
+            if not line:  # the stream ended: fall back to looking
+                time.sleep(max(0, until - time.time()))
+                break
+            if target["block"].encode() in line:
+                break
+
+
+def cmd_read(args):
+    target = resolve(args.target)
+    out = rex("capture", "-s", target["session"], "-b", target["block"], "--trim")
+    lines = [l.rstrip() for l in out.splitlines()]
+    while lines and not lines[-1]:
+        lines.pop()
+    print("\n".join(lines[-args.lines:]))
+
+
+def cmd_stop(args):
+    target = resolve(args.target)
+    rex("block", "send-key", "-s", target["session"], "-b", target["block"],
+        "escape")
+    print("stopped %s" % target["name"])
+
+
+def cmd_close(args):
+    target = resolve(args.target)
+    rex("block", "close", "-s", target["session"], target["block"])
+    print("closed %s" % target["name"])
+
+
+HELP = """\
+usage: trex COMMAND [options]
+
+Coding agents (Claude Code, Codex, OpenCode) talking to each other inside Rex.
+Each one is its normal TUI in a pane; trex finds them, starts new ones and
+passes messages between them. An answer arrives as the asker's next prompt.
+
+commands:
+  ls [-a]                      list agents: name, state, block, directory, title
+  spawn AGENT [PROMPT]         start claude, codex or opencode in a new pane
+  send TARGET [TEXT]           send an agent a message (stdin when no TEXT)
+  inbox [--wait]               print the messages left for you, a root agent
+  reply [TEXT]                 answer the agent that started you ($TREX_PARENT)
+  wait TARGET [--for SECS]     block until its turn ends; prints its state
+  read TARGET [-n LINES]       print the tail of its pane
+  stop TARGET                  interrupt its turn (Escape); the pane stays
+  close TARGET                 close its pane
+
+TARGET is a pane's name (-n at spawn, else claude / codex / opencode), or a
+block id or its tail from `trex ls`. A name reaches this session only.
+
+examples:
+  trex ls -a
+  trex spawn codex "review the diff in src/auth.rs"
+  trex spawn claude -n reviewer -m opus --mode auto --split right "..."
+  trex send codex "which test covers the retry path?"
+  git diff | trex send reviewer
+  trex wait codex --for 300 && trex read codex -n 60
+  trex close reviewer
+
+`trex COMMAND -h` shows a command's options.
+Manual: %s
+""" % os.path.join(os.path.dirname(os.path.realpath(__file__)), "README.md")
+
+
+def main():
+    ap = argparse.ArgumentParser(prog="trex", usage="trex COMMAND [options]")
+    ap.format_help = lambda: HELP
+    sub = ap.add_subparsers(dest="cmd", metavar="COMMAND")
+
+    p = sub.add_parser("ls", help="list agents: name, state, block, directory, title")
+    p.add_argument("-a", "--all", action="store_true", help="every session, not just this one")
+    p.set_defaults(fn=cmd_ls)
+
+    p = sub.add_parser("spawn", help="start claude, codex or opencode in a new pane")
+    p.add_argument("agent", choices=sorted(AGENTS))
+    p.add_argument("prompt", nargs="*", help="its first prompt ('-' reads stdin)")
+    p.add_argument("-n", "--name", help="pane label to address it by")
+    p.add_argument("-m", "--model", help="model, as the agent's own CLI names it")
+    p.add_argument("-e", "--effort", help="reasoning effort (claude, codex), as the agent names it")
+    p.add_argument("--add-dir", action="append", metavar="DIR",
+                   help="another directory its sandbox may write (claude, codex); repeatable")
+    p.add_argument("--mode", choices=MODES,
+                   help="what it may do without asking (default: %s)" % SPAWN_MODE)
+    p.add_argument("-c", "--cwd", help="working directory (default: here)")
+    p.add_argument("-w", "--worktree", metavar="NAME",
+                   help="run in git worktree NAME (branch NAME, in %s beside the "
+                        "main checkout); made when missing, reused when present"
+                        % WORKTREE_DIR.replace("{repo}", "<repo>"))
+    p.add_argument("--base", metavar="REF", help="what a new --worktree starts from (default: HEAD)")
+    p.add_argument("-s", "--session", help="Rex session (default: this one)")
+    p.add_argument("--split", choices=["right", "left", "above", "below"],
+                   help="split beside your pane instead of a new tab")
+    p.set_defaults(fn=cmd_spawn)
+
+    p = sub.add_parser("send", help="send an agent a message (text, or stdin)")
+    p.add_argument("target")
+    p.add_argument("text", nargs="*", help="the message (stdin when omitted)")
+    p.add_argument("--reply", action="store_true", help="this answers a message of theirs")
+    p.add_argument("--fyi", action="store_true", help="a note that wants no answer")
+    p.set_defaults(fn=cmd_send)
+
+    p = sub.add_parser("reply", help="answer the agent that started you")
+    p.add_argument("text", nargs="*", help="the answer (stdin when omitted)")
+    p.set_defaults(fn=cmd_reply)
+
+    p = sub.add_parser("inbox", help="print and remove the messages left for you")
+    p.add_argument("--wait", action="store_true", help="block until there is one")
+    p.add_argument("--for", dest="timeout", type=float, default=86400,
+                   help="with --wait, give up after SECS (default: a day)")
+    p.set_defaults(fn=cmd_inbox)
+
+    p = sub.add_parser("wait", help="block until an agent's turn ends; prints its state")
+    p.add_argument("target")
+    p.add_argument("--for", dest="timeout", type=float, default=WAIT_TIMEOUT,
+                   metavar="SECS", help="give up after SECS (default %d)" % WAIT_TIMEOUT)
+    p.set_defaults(fn=cmd_wait)
+
+    p = sub.add_parser("read", help="print the tail of an agent's pane")
+    p.add_argument("target")
+    p.add_argument("-n", "--lines", type=int, default=READ_LINES)
+    p.set_defaults(fn=cmd_read)
+
+    p = sub.add_parser("stop", help="interrupt an agent's turn; the pane stays")
+    p.add_argument("target")
+    p.set_defaults(fn=cmd_stop)
+
+    p = sub.add_parser("close", help="close an agent's pane")
+    p.add_argument("target")
+    p.set_defaults(fn=cmd_close)
+
+    args = ap.parse_args()
+    if not args.cmd:
+        ap.print_help()
+        return
+    args.fn(args)
+
+
+if __name__ == "__main__":
+    main()
