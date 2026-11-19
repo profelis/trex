@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # trex — coding agents talking to each other inside Rex.
 #
-# Every agent (Claude Code, Codex, OpenCode) runs as its normal TUI in a Rex
+# Every agent (Claude Code, Codex, OpenCode, Vibe) runs as its normal TUI in a Rex
 # pane. trex finds those panes, starts new ones, and delivers a message by
 # pasting it into the recipient's prompt; the recipient answers the same way,
 # so the answer arrives as the sender's next prompt. The only state of its
@@ -35,7 +35,7 @@ from concurrent.futures import ThreadPoolExecutor
 # ===========================================================================
 
 # The agents trex knows. The key is both the name used on the command line
-# and the process name it looks for in a pane.
+# and, unless `processes` overrides it, the process name in a pane.
 #   cmd          how `spawn` starts it
 #   prompt_flag  flag that carries the first prompt (None: a bare argument)
 #   model        arguments behind `spawn -m MODEL` ({model} is replaced)
@@ -90,6 +90,25 @@ AGENTS = {
         "modes": {
             "auto": ["--auto"],
             "full": ["--auto"],
+        },
+    },
+    "vibe": {
+        "cmd": ["vibe"],
+        # Vibe 3's Python launcher execs the native Rust TUI.
+        "processes": ["vibe", "vibe-rs"],
+        # --prompt is headless: a positional prompt keeps the chat open.
+        "prompt_flag": None,
+        # --model and --thinking are headless-only. The environment layer
+        # selects the interactive model without changing the user's config.
+        "model": [],
+        "model_env": {"VIBE_ACTIVE_MODEL": "{model}"},
+        "effort": None,
+        "effort_hint": "vibe takes no effort at interactive startup; set the "
+                       "model's thinking in Vibe config or use /model",
+        "add_dir": ["--add-dir", "{dir}"],
+        "modes": {
+            "auto": ["--trust", "--smart-approve"],
+            "full": ["--trust", "--auto-approve"],
         },
     },
 }
@@ -201,7 +220,8 @@ def inspect(session, block):
     proc = rex_json("block", "call", "-s", sid, "-b", bid, "process", check=False)
     fg = proc.get("foreground") or {}
     names = [fg.get("name")] + [a.get("name") for a in proc.get("ancestors") or []]
-    kind = next((n for n in names if n in AGENTS), None)
+    kind = next((k for n in names for k, spec in AGENTS.items()
+                 if n in spec.get("processes", [k])), None)
     if not kind:
         return None
     records = rex_json("block", "call", "-s", sid, "-b", bid, "program_status",
@@ -416,8 +436,9 @@ def spawn_command(agent, mode, model=None, effort=None, dirs=(), prompt=None):
                     for k, v in spec.get("model_env", {}).items()})
     if effort:
         if spec["effort"] is None:
-            die("%s takes no effort at start: put it in the model "
-                "(provider/model#variant) or its config" % agent, 2)
+            die(spec.get("effort_hint") or
+                ("%s takes no effort at start: put it in the model "
+                 "(provider/model#variant) or its config" % agent), 2)
         cmd += [a.format(effort=effort) for a in spec["effort"]]
     for d in dirs:
         if spec["add_dir"] is None:
@@ -694,13 +715,13 @@ def cmd_close(args):
 HELP = """\
 usage: trex COMMAND [options]
 
-Coding agents (Claude Code, Codex, OpenCode) talking to each other inside Rex.
+Coding agents (Claude Code, Codex, OpenCode, Vibe) talking to each other inside Rex.
 Each one is its normal TUI in a pane; trex finds them, starts new ones and
 passes messages between them. An answer arrives as the asker's next prompt.
 
 commands:
   ls [-a]                      list agents: name, state, block, directory, title
-  spawn AGENT [PROMPT]         start claude, codex or opencode in a new pane
+  spawn AGENT [PROMPT]         start claude, codex, opencode or vibe in a new pane
   send TARGET [TEXT]           send an agent a message (stdin when no TEXT)
   inbox [--wait]               print the messages left for you, a root agent
   reply [TEXT]                 answer the agent that started you ($TREX_PARENT)
@@ -709,7 +730,7 @@ commands:
   stop TARGET                  interrupt its turn (Escape); the pane stays
   close TARGET                 close its pane
 
-TARGET is a pane's name (-n at spawn, else claude / codex / opencode), or a
+TARGET is a pane's name (-n at spawn, else claude / codex / opencode / vibe), or a
 block id or its tail from `trex ls`. A name reaches this session only.
 
 examples:
@@ -735,14 +756,14 @@ def main():
     p.add_argument("-a", "--all", action="store_true", help="every session, not just this one")
     p.set_defaults(fn=cmd_ls)
 
-    p = sub.add_parser("spawn", help="start claude, codex or opencode in a new pane")
+    p = sub.add_parser("spawn", help="start claude, codex, opencode or vibe in a new pane")
     p.add_argument("agent", choices=sorted(AGENTS))
     p.add_argument("prompt", nargs="*", help="its first prompt ('-' reads stdin)")
     p.add_argument("-n", "--name", help="pane label to address it by")
     p.add_argument("-m", "--model", help="model, as the agent's own CLI names it")
     p.add_argument("-e", "--effort", help="reasoning effort (claude, codex), as the agent names it")
     p.add_argument("--add-dir", action="append", metavar="DIR",
-                   help="another directory its sandbox may write (claude, codex); repeatable")
+                   help="another directory it may access (claude, codex, vibe); repeatable")
     p.add_argument("--mode", choices=MODES,
                    help="what it may do without asking (default: %s)" % SPAWN_MODE)
     p.add_argument("-c", "--cwd", help="working directory (default: here)")

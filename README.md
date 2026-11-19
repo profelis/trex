@@ -1,7 +1,7 @@
 # trex
 
 Coding agents talking to each other inside [Rex](https://www.superlogical.com/rex).
-Claude Code, Codex and OpenCode each run as their normal TUI in a Rex pane;
+Claude Code, Codex, OpenCode and Mistral Vibe each run as their normal TUI in a Rex pane;
 `trex` finds those panes, starts new ones, and passes messages between them.
 
 > **A proof of concept.** trex is an experiment that shows one way agents can
@@ -30,6 +30,7 @@ trex ls                    # agents in this session, children under their starte
 trex ls -a                 # agents in every session
 trex spawn codex "review the diff in src/auth.rs"
 trex spawn claude -n reviewer -m opus --split right "…"
+trex spawn -n mistral --add-dir ../shared vibe "review the diff"
 trex spawn codex -m gpt-5 -e high -w fix-retry "…"   # new worktree + branch
 trex send codex "which test covers the retry path?"
 git diff | trex send reviewer
@@ -68,13 +69,29 @@ in which pane and the status each agent reports (`working`, `idle`, `done`,
 
 ## Permission modes
 
-| `--mode` | Claude Code | Codex | OpenCode |
-|---|---|---|---|
-| `own` | nothing added | nothing added | nothing added |
-| `auto` (default) | `--permission-mode auto` | `--approve-for-me` | `--auto` |
-| `full` | `--dangerously-skip-permissions` | `--dangerously-bypass-approvals-and-sandbox` | `--auto` |
+| `--mode` | Claude Code | Codex | OpenCode | Vibe |
+|---|---|---|---|---|
+| `own` | nothing added | nothing added | nothing added | nothing added |
+| `auto` (default) | `--permission-mode auto` | `--approve-for-me` | `--auto` | `--trust --smart-approve` |
+| `full` | `--dangerously-skip-permissions` | `--dangerously-bypass-approvals-and-sandbox` | `--auto` | `--trust --auto-approve` |
 
 Only a person at a shell can start an agent in `full`.
+
+Vibe support targets 3.1.3 (including its `vibe-rs` process). `auto` uses its
+risk classifier and can still ask about risky actions; `full` approves every
+tool call. `--trust` trusts the selected working directory for this invocation.
+`--add-dir` adds directories Vibe may access. Authentication stays with Vibe:
+run `vibe --setup` or set `MISTRAL_API_KEY` in the launching environment.
+
+`-m ALIAS` selects Vibe's interactive model through `VIBE_ACTIVE_MODEL`, without
+editing its config. Vibe's `--model` and `--thinking` flags are headless-only;
+`-e` is refused for Vibe. Set thinking in its model config or with `/model`.
+The initial prompt is positional so the TUI stays open for `send` and `reply`.
+
+Vibe reports native program statuses to Rex over OSC 7501: no screen scraping
+or completion hook is needed. `wait` and the tab watcher consume these reports,
+including errors and approval prompts. A finished turn means the chat is ready
+for follow-up; it does not certify that the requested code change is correct.
 
 ## Things to know
 
@@ -85,6 +102,12 @@ Only a person at a shell can start an agent in `full`.
   turns it on. Its sandbox keeps `.git` read-only, so git writes need
   escalation.
 - `read` shows the pane as drawn; for Codex and OpenCode that is one screen.
+
+## Tests
+
+Run the stdlib test suite with `python3 -m unittest discover -s tests -v`.
+It covers launch arguments, permission modes, process recognition, status handling
+and blocked-message protection for all four agents, using mocked Rex responses.
 
 ## License
 

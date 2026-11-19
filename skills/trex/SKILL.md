@@ -1,7 +1,7 @@
 ---
 name: trex
 description: >-
-  Work with other coding agents (Claude Code, Codex, OpenCode) running in Rex
+  Work with other coding agents (Claude Code, Codex, OpenCode, Mistral Vibe) running in Rex
   panes: list them, start one, send it a message and get its answer back as
   your next prompt. Use when asked to involve, ask, ping, hand off to or get a
   review from another agent or another model, to start an agent in a new pane,
@@ -21,6 +21,7 @@ trex reply "the result"  # answer the agent that started you
 trex inbox --wait       # root Claude: background waiter for answers (see below)
 trex spawn codex "review the diff in src/auth.rs for the token refresh bug"
 trex spawn claude -n reviewer -m opus --split right "…"
+trex spawn -n mistral vibe "review the diff"
 trex spawn codex -m gpt-5 -e high -w fix-retry "…"  # in worktree+branch fix-retry
 trex spawn opencode -n review -w fix-retry "…"       # the same worktree, reused
 trex send codex "which test covers the retry path?"
@@ -49,10 +50,16 @@ when missing, reused when it exists, so a reviewer joins the worker's tree.
 `-e` sets reasoning effort for Claude and Codex; for OpenCode the variant is
 part of the model (`provider/model#variant`). `-m` on OpenCode starts it with
 its own server (`--standalone`), since its TUI has no model flag.
+Vibe's `-m ALIAS` uses `VIBE_ACTIVE_MODEL` for its interactive TUI; `-e` is
+unsupported (set thinking in Vibe config or `/model`). `--add-dir` is supported.
 
 A spawned agent starts in `auto` by default: it works unattended, and each
 harness's own automatic reviewer approves routine actions (Claude
-`--permission-mode auto`, Codex `--approve-for-me`, OpenCode `--auto`).
+`--permission-mode auto`, Codex `--approve-for-me`, OpenCode `--auto`, Vibe
+`--trust --smart-approve`). Vibe can still ask about risky actions; its `full`
+mode uses `--trust --auto-approve`. Vibe authentication must already be set up
+(`vibe --setup` or `MISTRAL_API_KEY`). Vibe 3.1.3 reports its turn status directly
+to Rex, including completion, errors and approval prompts.
 `--mode own` adds nothing and leaves it to the agent's own config. `--mode
 full` (no prompts, no sandbox) is refused to agents: if a task needs it, ask
 the user to run that `trex spawn` themselves.
